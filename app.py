@@ -3,8 +3,7 @@ import cv2
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import os
-import io, zipfile  # NEW
+import io, zipfile
 
 st.set_page_config(page_title="Fluorescence Segmentation", layout="wide")
 
@@ -15,6 +14,10 @@ if "results" not in st.session_state:        # list of dicts with counts/params
     st.session_state.results = []
 if "method" not in st.session_state:
     st.session_state.method = "HSV (GFP-like)"
+if "masks_zip_bytes" not in st.session_state:
+    st.session_state.masks_zip_bytes = None
+if "results_csv_bytes" not in st.session_state:
+    st.session_state.results_csv_bytes = None
 
 # ----------------- Utils -----------------
 def to_uint8(img):
@@ -71,6 +74,36 @@ def overlay_mask(bgr_u8, mask, alpha=0.6, color=(0,255,0)):
     color_layer[mask > 0] = color
     return cv2.addWeighted(color_layer, alpha, bgr_u8, 1 - alpha, 0)
 
+def build_masks_zip_bytes(results, files):
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for r, f in zip(results, files):
+            arr = cv2.imdecode(np.frombuffer(f["bytes"], np.uint8), cv2.IMREAD_UNCHANGED)
+            bgr = ensure_bgr_u8(arr)
+            if r["method"] == "hsv":
+                mask = apply_hsv(
+                    bgr,
+                    (int(r["h_low"]), int(r["s_low"]), int(r["v_low"])),
+                    (int(r["h_high"]), 255, 255),
+                    int(r["ksize"])
+                )
+            elif r["method"] == "lab":
+                mask = apply_lab(
+                    bgr,
+                    (int(r["Lmin"]), int(r["Lmax"])),
+                    (int(r["amin"]), int(r["amax"])),
+                    (int(r["bmin"]), int(r["bmax"])),
+                    int(r["ksize"])
+                )
+            else:
+                mask = apply_rgb(bgr, int(r["g_min"]), int(r["g_margin"]), int(r["ksize"]))
+            base = Path(r["image"]).stem
+            ok, png_bytes = cv2.imencode(".png", mask)
+            if ok:
+                zf.writestr(f"{base}_mask_{r['method']}.png", png_bytes.tobytes())
+    mem_zip.seek(0)
+    return mem_zip.getvalue()
+
 # ----------------- UI: Settings -----------------
 st.title("Fluorescence Mask & Quantification")
 
@@ -92,7 +125,6 @@ if method.startswith("HSV"):
     h_high = st.sidebar.slider("H high", 0, 179, 85)
     s_low  = st.sidebar.slider("S low",  0, 255, 40)
     v_low  = st.sidebar.slider("V low",  0, 255, 40)
-    s_high, v_high = 255, 255
 elif method.startswith("Lab"):
     st.sidebar.subheader("Lab thresholds (OpenCV 8-bit scaled)")
     Lmin = st.sidebar.slider("L min", 0, 255, 0)
@@ -106,37 +138,32 @@ else:
     g_min   = st.sidebar.slider("G minimum", 0, 255, 90)
     g_margin= st.sidebar.slider("G margin over R and B", 0, 100, 25)
 
-st.sidebar.markdown("---")
-# Robust output folder handling (Downloads by default) for optional server-side saves
-default_downloads = Path.home() / "Downloads" / "fluorescence_outputs"
-out_dir_input = st.sidebar.text_input("Output folder (for server-side saves)", str(default_downloads))
-out_dir = Path(out_dir_input).expanduser().resolve()
-masks_dir = out_dir / "masks"
-out_dir.mkdir(parents=True, exist_ok=True)
-masks_dir.mkdir(parents=True, exist_ok=True)
-if not os.access(out_dir, os.W_OK):
-    st.warning(f"Output folder may not be writeable: {out_dir}")
-
 # ----------------- Upload (multi-file) -----------------
 uploaded_files = st.file_uploader(
     "Upload one or more images (tif/png/jpg)",
     type=["tif","tiff","png","jpg","jpeg","bmp"],
     accept_multiple_files=True
 )
-
-# Cache uploaded file bytes in session_state so we can reuse them
 if uploaded_files:
     st.session_state.files = [{"name": uf.name, "bytes": uf.getvalue()} for uf in uploaded_files]
 
+# Buttons
 colL, colR = st.columns(2)
 with colL:
-    process_btn = st.button("Process & Preview")
+    process_btn = st.button("Process & Preview", use_container_width=True)
 with colR:
-    save_btn = st.button("Save CSV + Masks (server)")
+    reset_btn = st.button("Reset Session", use_container_width=True)
+
+if reset_btn:
+    st.session_state.files = []
+    st.session_state.results = []
+    st.session_state.masks_zip_bytes = None
+    st.session_state.results_csv_bytes = None
+    st.rerun()
 
 # ----------------- Process -----------------
 if process_btn and st.session_state.files:
-    st.session_state.results = []  # reset results for a fresh run
+    st.session_state.results = []  # fresh run
     cols = st.columns(2)
 
     for i, f in enumerate(st.session_state.files):
@@ -146,9 +173,9 @@ if process_btn and st.session_state.files:
         total = int(H * W)
 
         if method.startswith("HSV"):
-            mask = apply_hsv(bgr, (h_low, s_low, v_low), (h_high, s_high, v_high), ksize)
+            mask = apply_hsv(bgr, (h_low, s_low, v_low), (h_high, 255, 255), ksize)
             method_key = "hsv"
-            param_dict = {"h_low": h_low, "h_high": h_high, "s_low": s_low, "s_high": s_high, "v_low": v_low, "v_high": v_high}
+            param_dict = {"h_low": h_low, "h_high": h_high, "s_low": s_low, "s_high": 255, "v_low": v_low, "v_high": 255}
         elif method.startswith("Lab"):
             mask = apply_lab(bgr, (Lmin, Lmax), (amin, amax), (bmin, bmax), ksize)
             method_key = "lab"
@@ -164,8 +191,8 @@ if process_btn and st.session_state.files:
 
         with cols[i % 2]:
             st.markdown(f"**{f['name']}** — {H}×{W} px")
-            st.image(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB), caption=f"{method_key.upper()} overlay", use_column_width=True)
-            st.image(mask, caption=f"{method_key.upper()} mask", clamp=True, use_column_width=True)  # if error, change to method_key.upper()
+            st.image(cv2.cvtColor(ov, cv2.COLOR_BGR2RGB), caption=f"{method_key.upper()} overlay", use_container_width=True)
+            st.image(mask, caption=f"{method_key.upper()} mask", clamp=True, use_container_width=True)
             st.write(f"Fluorescent pixels: **{count} / {total}**  (ratio = **{ratio:.6f}**)")
 
         row = {
@@ -176,104 +203,33 @@ if process_btn and st.session_state.files:
         row.update(param_dict)
         st.session_state.results.append(row)
 
+    # Build downloadable artifacts once after processing
     if st.session_state.results:
-        st.subheader("Summary table")
-        st.dataframe(pd.DataFrame(st.session_state.results), use_container_width=True)
-
-        # --------- NEW: Download CSV (in-memory) ----------
         df_tmp = pd.DataFrame(st.session_state.results)
+        st.session_state.results_csv_bytes = df_tmp.to_csv(index=False).encode("utf-8")
+        st.session_state.masks_zip_bytes = build_masks_zip_bytes(st.session_state.results, st.session_state.files)
+
+# ----------------- Downloads (persist and always visible if results exist) -----------------
+if st.session_state.results:
+    st.subheader("Results & Downloads")
+    st.dataframe(pd.DataFrame(st.session_state.results), use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
         st.download_button(
             "Download CSV",
-            data=df_tmp.to_csv(index=False).encode("utf-8"),
+            data=st.session_state.results_csv_bytes or b"",
             file_name="results.csv",
             mime="text/csv",
-            use_container_width=True
+            use_container_width=True,
+            key="dl_csv"
         )
-
-        # --------- NEW: Download masks as ZIP (in-memory) ----------
-        def build_masks_zip_bytes(results, files):
-            mem_zip = io.BytesIO()
-            with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for r, f in zip(results, files):
-                    arr = cv2.imdecode(np.frombuffer(f["bytes"], np.uint8), cv2.IMREAD_UNCHANGED)
-                    bgr = ensure_bgr_u8(arr)
-                    if r["method"] == "hsv":
-                        mask = apply_hsv(
-                            bgr,
-                            (int(r["h_low"]), int(r["s_low"]), int(r["v_low"])),
-                            (int(r["h_high"]), int(r["s_high"]), int(r["v_high"])),
-                            int(r["ksize"])
-                        )
-                    elif r["method"] == "lab":
-                        mask = apply_lab(
-                            bgr,
-                            (int(r["Lmin"]), int(r["Lmax"])),
-                            (int(r["amin"]), int(r["amax"])),
-                            (int(r["bmin"]), int(r["bmax"])),
-                            int(r["ksize"])
-                        )
-                    else:
-                        mask = apply_rgb(bgr, int(r["g_min"]), int(r["g_margin"]), int(r["ksize"]))
-
-                    base = Path(r["image"]).stem
-                    # Encode PNG into memory and write to zip
-                    ok, png_bytes = cv2.imencode(".png", mask)
-                    if ok:
-                        zf.writestr(f"{base}_mask_{r['method']}.png", png_bytes.tobytes())
-            mem_zip.seek(0)
-            return mem_zip.getvalue()
-
-        masks_zip_bytes = build_masks_zip_bytes(st.session_state.results, st.session_state.files)
+    with col2:
         st.download_button(
             "Download Masks (ZIP)",
-            data=masks_zip_bytes,
+            data=st.session_state.masks_zip_bytes or b"",
             file_name="masks.zip",
             mime="application/zip",
-            use_container_width=True
+            use_container_width=True,
+            key="dl_masks"
         )
-
-# ----------------- Save to server (optional) -----------------
-if save_btn:
-    if not st.session_state.results:
-        st.warning("Click 'Process & Preview' first.")
-    else:
-        try:
-            df = pd.DataFrame(st.session_state.results)
-            csv_path = out_dir / "results.csv"
-
-            # Append or create CSV
-            if csv_path.exists():
-                old = pd.read_csv(csv_path)
-                df = pd.concat([old, df], ignore_index=True)
-            df.to_csv(csv_path, index=False)
-
-            # Save masks using the same parameters used during processing
-            for r, f in zip(st.session_state.results, st.session_state.files):
-                arr = cv2.imdecode(np.frombuffer(f["bytes"], np.uint8), cv2.IMREAD_UNCHANGED)
-                bgr = ensure_bgr_u8(arr)
-                if r["method"] == "hsv":
-                    mask = apply_hsv(
-                        bgr,
-                        (int(r["h_low"]), int(r["s_low"]), int(r["v_low"])),
-                        (int(r["h_high"]), int(r["s_high"]), int(r["v_high"])),
-                        int(r["ksize"])
-                    )
-                elif r["method"] == "lab":
-                    mask = apply_lab(
-                        bgr,
-                        (int(r["Lmin"]), int(r["Lmax"])),
-                        (int(r["amin"]), int(r["amax"])),
-                        (int(r["bmin"]), int(r["bmax"])),
-                        int(r["ksize"])
-                    )
-                else:
-                    mask = apply_rgb(bgr, int(r["g_min"]), int(r["g_margin"]), int(r["ksize"]))
-
-                base = Path(r["image"]).stem
-                cv2.imwrite(str(masks_dir / f"{base}_mask_{r['method']}.png"), mask)
-
-            st.success(f"Saved CSV to {csv_path} and masks to {masks_dir}")
-
-        except Exception as e:
-            st.error("Failed to save outputs.")
-            st.exception(e)
